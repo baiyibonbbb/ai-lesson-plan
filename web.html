@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>AI教案自动生成工具</title>
+    <style>
+        * {box-sizing: border-box;margin: 0;padding: 0;font-family: "Microsoft YaHei";}
+        body {background: #f5f7fa;padding: 60px 20px;max-width: 600px;margin: 0 auto;}
+        .box {background: white;padding: 30px;border-radius: 16px;box-shadow: 0 2px 15px rgba(0,0,0,0.08);}
+        h2 {margin-bottom: 20px;color: #333;}
+        input {width: 100%;padding: 14px 16px;font-size: 16px;border: 1px solid #ddd;border-radius: 8px;margin-bottom: 16px;outline: none;}
+        button {width: 100%;padding: 14px;font-size: 16px;background: #2d8cf0;color: white;border: none;border-radius: 8px;cursor: pointer;}
+        button:hover {background: #1b79d8;}
+        .tip {margin-top: 12px;color: #888;font-size: 14px;}
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>📝 AI教案自动生成工具</h2>
+        <input type="text" id="topic" placeholder="输入课程名称，例如：JavaWeb程序设计">
+        <button onclick="create()">立即生成教案并下载</button>
+        <div class="tip">输入课程名 → AI自动生成 → 自动下载文档</div>
+    </div>
+
+    <script>
+        function create() {
+            let topic = document.getElementById("topic").value.trim();
+            if (!topic) {
+                alert("请输入课程名称");
+                return;
+            }
+            window.open(`/generate?topic=${encodeURIComponent(topic)}`);
+        }
+    </script>
+</body>
+</html>
