@@ -1,126 +1,103 @@
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import re
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
-import requests
+import io
+import base64
 from docx import Document
-import tempfile
+import openai
+import json
 
-app = FastAPI(title="AI教案生成Coze插件")
+app = Flask(__name__)
+CORS(app)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 火山方舟API配置
+openai.api_key = os.getenv("ARK_API_KEY")
+openai.api_base = "https://ark.cn-beijing.volces.com/api/v3"
+MODEL_ID = os.getenv("ARK_MODEL_ID")
 
-# ===================== AI 配置 =====================
-DOUBAO_API_KEY = "ark-c923f9c20215-4823-bd76-e51cbe57e5fe"
-DOUBAO_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-MODEL = "doubao-3-lite"
+# 直接用你本地的模板文件
+TEMPLATE_PATH = "模板.docx"
 
-# ===================== 生成教案 =====================
-def generate_lesson_plan(topic: str):
-    try:
-        with open("AI 生成教案专用指令.txt", "r", encoding="utf-8") as f:
-            prompt = f.read().strip()
-    except:
-        prompt = "你是一名职业院校教师，请生成一份专业、完整、可直接使用的教案。"
+def generate_lesson_content(topic):
+    """调用AI生成教案内容"""
+    prompt = f"""
+    请为《{topic}》课程生成一份标准教案，包含以下内容：
+    1. 课程名称
+    2. 内容分析
+    3. 教学目标（素质目标、知识目标、能力目标）
+    4. 教学重点
+    5. 教学难点
+    请以JSON格式输出，key为：
+    "course_name", "content_analysis", "quality_goal", "knowledge_goal", "ability_goal", "key_points", "difficult_points"
+    """
+    
+    response = openai.ChatCompletion.create(
+        model=MODEL_ID,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return json.loads(response.choices[0].message.content)
 
-    prompt += f"\n课程主题：{topic}"
-
-    headers = {
-        "Authorization": f"Bearer {DOUBAO_API_KEY}",
-        "Content-Type": "application/json"
+def fill_template(content, template_path):
+    """完整填充Word模板，修复表格占位符问题"""
+    doc = Document(template_path)
+    
+    # 严格匹配你模板里的&1&到&7&占位符
+    placeholders = {
+        "&1&": content["course_name"],
+        "&2&": content["content_analysis"],
+        "&3&": content["quality_goal"],
+        "&4&": content["knowledge_goal"],
+        "&5&": content["ability_goal"],
+        "&6&": content["key_points"],
+        "&7&": content["difficult_points"]
     }
-
-    data = {
-        "model": MODEL,
-        "messages": [{"role": "user", "content": prompt}]
-    }
-
-    try:
-        resp = requests.post(DOUBAO_URL, headers=headers, json=data, timeout=120)
-        res = resp.json()
-        return res["choices"][0]["message"]["content"]
-    except Exception as e:
-        print("AI错误:", e)
-        return ""
-
-# ===================== 解析格式 =====================
-def parse_content(text):
-    data = {}
-    matches = re.findall(r"&(\d+)&(.*?)&", text, re.DOTALL)
-    for num, val in matches:
-        try:
-            data[int(num)] = val.strip()
-        except:
-            continue
-    return data
-
-# ===================== 生成WORD =====================
-def create_docx(data):
-    doc = Document("模板.docx")
-    for p in doc.paragraphs:
-        for k, v in data.items():
-            p.text = p.text.replace(f"&{k}&", v)
+    
+    # 遍历所有段落替换
+    for paragraph in doc.paragraphs:
+        for key, value in placeholders.items():
+            if key in paragraph.text:
+                paragraph.text = paragraph.text.replace(key, value)
+    
+    # 遍历所有表格单元格替换（关键修复！）
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for p in cell.paragraphs:
-                    for k, v in data.items():
-                        p.text = p.text.replace(f"&{k}&", v)
-    tmp = tempfile.mktemp(".docx")
-    doc.save(tmp)
-    return tmp
+                for paragraph in cell.paragraphs:
+                    for key, value in placeholders.items():
+                        if key in paragraph.text:
+                            paragraph.text = paragraph.text.replace(key, value)
+    
+    # 直接返回内存中的文件流，不存临时文件
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
 
-# ===================== Coze 插件专用接口 =====================
-@app.post("/coze/plugin", summary="Coze插件接口")
-def coze_plugin(topic: str):
+@app.route('/coze/plugin', methods=['GET'])
+def coze_plugin():
+    topic = request.args.get('topic')
     if not topic:
-        return JSONResponse({"code": 1, "msg": "请输入课程名称"})
+        return jsonify({"status": "error", "message": "缺少topic参数"}), 400
+    
+    try:
+        # 1. 生成教案内容
+        content = generate_lesson_content(topic)
+        
+        # 2. 填充模板，直接生成内存文件流
+        buffer = fill_template(content, TEMPLATE_PATH)
+        
+        # 3. 转成base64返回，避免403下载问题
+        file_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+        
+        return jsonify({
+            "status": "success",
+            "filename": f"{topic}_教案.docx",
+            "file_base64": file_base64,
+            "message": "教案生成成功，文件内容已直接返回，不会再出现403错误"
+        })
+    
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-    # 生成教案
-    content = generate_lesson_plan(topic)
-    if not content:
-        return JSONResponse({"code": 1, "msg": "AI生成失败"})
-
-    # 解析并生成文档
-    data = parse_content(content)
-    if not data:
-        return JSONResponse({"code": 1, "msg": "教案格式解析失败"})
-
-    docx_path = create_docx(data)
-
-    # 返回 Coze 插件标准格式
-    return {
-        "code": 0,
-        "message": "success",
-        "data": {
-            "topic": topic,
-            "download_url": f"https://ai-lesson-plan-rdxl.onrender.com/generate?topic={topic}",
-            "tip": "点击链接直接下载教案 Word 文件"
-        }
-    }
-
-# ===================== 下载接口 =====================
-@app.get("/generate")
-def generate(topic: str):
-    content = generate_lesson_plan(topic)
-    data = parse_content(content)
-    docx_file = create_docx(data)
-    return FileResponse(docx_file, filename=f"{topic}教案.docx")
-
-# ===================== 网页 =====================
-@app.get("/")
-def index():
-    with open("web.html", "r", encoding="utf-8") as f:
-        return HTMLResponse(f.read())
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000)
