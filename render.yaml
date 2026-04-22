@@ -1,9 +1,11 @@
 services:
   - type: web
-    name: ai-lesson-plan-generator
+    name: ai-lesson-plan
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python api_server.py
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
+      - key: ARK_API_KEY
+        sync: false
+      - key: ARK_MODEL_ID
+        sync: false
