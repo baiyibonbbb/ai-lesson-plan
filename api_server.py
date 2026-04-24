@@ -1,111 +1,108 @@
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-from docx import Document
-import openai
-import io
-import base64
-import os
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import re
-import functools
-import logging
-import time
+import os
+import requests
+from docx import Document
+import tempfile
 
-# 日志配置
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI(title="AI教案生成系统")
 
-app = Flask(__name__)
-CORS(app)
-app.static_folder = '.'
-app.static_url_path = ''
+# 允许跨域
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-openai.api_key = os.getenv("ARK_API_KEY")
-openai.api_base = "https://ark.cn-beijing.volces.com/api/v3"
-MODEL_ID = os.getenv("ARK_MODEL_ID")
+# ===================== AI 配置 =====================
+DOUBAO_API_KEY = "ark-c923f9c2-0215-4823-b2e0-792b1ed1cbe5-7e5fe"
+DOUBAO_URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
+DOUBAO_MODEL = "doubao-seed-2-0-pro-260215"
 
-TEMPLATE_PATH = "模板.docx"
-PROMPT_FILE = "AI 生成教案专用指令.txt"
+# ===================== 读取指令 =====================
+def get_prompt(topic):
+    try:
+        with open("AI 生成教案专用指令.txt", "r", encoding="utf-8") as f:
+            prompt = f.read()
+        return prompt.strip() + f"\n课程主题：{topic}"
+    except:
+        return f"请生成职业院校专业课教案，格式&数字&内容，课程主题：{topic}"
 
-# 启动时预加载模板和指令
-logger.info("正在预加载模板和指令...")
-doc_template = Document(TEMPLATE_PATH)
-with open(PROMPT_FILE, "r", encoding="utf-8") as f:
-    AI_PROMPT = f.read()
+# ===================== 调用AI =====================
+def ai_generate(topic):
+    prompt = get_prompt(topic)
+    headers = {
+        "Authorization": f"Bearer {DOUBAO_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": DOUBAO_MODEL,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}]
+    }
+    try:
+        resp = requests.post(DOUBAO_URL, headers=headers, json=data, timeout=180)
+        res = resp.json()
+        for item in res.get("output", []):
+            if item.get("role") == "assistant":
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text":
+                        return c.get("text", "")
+    except Exception as e:
+        print("AI错误：", e)
+    return ""
 
-# 带重试机制的AI生成
-@functools.lru_cache(maxsize=100)
-def generate_content(topic):
-    full_prompt = AI_PROMPT + "\n课程主题：" + topic
-    logger.info(f"开始生成：{topic}")
-    start_time = time.time()
-    for attempt in range(3):  # 最多重试3次
-        try:
-            response = openai.ChatCompletion.create(
-                model=MODEL_ID,
-                messages=[{"role": "user", "content": full_prompt}],
-                temperature=0.1,
-                max_tokens=2000,
-                request_timeout=120  # 单次请求超时2分钟
-            )
-            content = response.choices[0].message.content
-            logger.info(f"生成完成，耗时：{time.time()-start_time:.2f}秒")
-            return content
-        except Exception as e:
-            logger.warning(f"生成失败，重试 {attempt+1}/3：{e}")
-            time.sleep(5)
-    raise Exception("AI生成多次失败")
-
-def parse_ai_output(text):
+# ===================== 解析格式 =====================
+def parse_content(text):
     data = {}
-    matches = re.findall(r"&(\d+)&(.*?)&\1&", text)
-    for idx, content in matches:
-        data[f"&{idx}&"] = content
+    matches = re.findall(r"&(\d+)&(.*?)&\1&", text, re.DOTALL)
+    for num, val in matches:
+        data[int(num)] = val.strip()
     return data
 
-def fill_template(content_map):
-    doc = Document(TEMPLATE_PATH)
-    for para in doc.paragraphs:
-        for k, v in content_map.items():
-            if k in para.text:
-                para.text = para.text.replace(k, v)
+# ===================== 生成Word =====================
+def make_docx(data):
+    doc = Document("模板.docx")
+    # 替换段落
+    for p in doc.paragraphs:
+        for k, v in data.items():
+            p.text = p.text.replace(f"&{k}&", v)
+    # 替换表格
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for para in cell.paragraphs:
-                    for k, v in content_map.items():
-                        if k in para.text:
-                            para.text = para.text.replace(k, v)
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer
+                for p in cell.paragraphs:
+                    for k, v in data.items():
+                        p.text = p.text.replace(f"&{k}&", v)
+    tmp = tempfile.mktemp(".docx")
+    doc.save(tmp)
+    return tmp
 
-@app.route('/')
+# ===================== 接口 =====================
+@app.get("/")
 def index():
-    return send_from_directory('.', 'web.html')
+    with open("web.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
-@app.route('/coze/plugin', methods=['GET', 'POST'])
-def plugin():
-    topic = request.args.get('topic') or (request.json.get('topic') if request.json else None)
-    if not topic:
-        return jsonify({"status": "error", "message": "need topic"}), 400
-    try:
-        ai_text = generate_content(topic)
-        content = parse_ai_output(ai_text)
-        buffer = fill_template(content)
-        b64 = base64.b64encode(buffer.read()).decode()
-        return jsonify({
-            "status": "success",
-            "filename": f"{topic}_教案.docx",
-            "file_base64": b64
-        })
-    except Exception as e:
-        logger.error(f"处理失败：{e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+@app.get("/generate")
+def generate(topic: str):
+    text = ai_generate(topic)
+    if not text:
+        return {"code": 1, "msg": "AI生成失败"}
+    data = parse_content(text)
+    if not data:
+        return {"code": 1, "msg": "解析失败，请检查AI返回格式"}
+    docx_file = make_docx(data)
+    return FileResponse(
+        path=docx_file,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=f"{topic}教案.docx"
+    )
 
-@app.route('/health')
-def health():
-    return "ok", 200
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
